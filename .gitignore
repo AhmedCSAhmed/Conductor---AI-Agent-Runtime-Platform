@@ -1,0 +1,11 @@
+# Go
+/conductor
+/bin/
+*.exe
+*.test
+*.out
+vendor/
+
+# Env and editors
+.env
+.DS_Store

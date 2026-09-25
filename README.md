@@ -8,8 +8,8 @@ When an AI agent runs for minutes or hours, everything that can go wrong will: t
 process dies mid-run, a tool call times out, the model returns garbage on attempt one
 and succeeds on attempt two. Conductor is the layer that makes those runs survivable.
 
-An agent execution is submitted through an HTTP control plane, driven to completion by
-a Temporal workflow, and mirrored into Postgres as a queryable record. Temporal owns
+Written in Go. An agent execution is submitted through an HTTP control plane, driven to
+completion by a Temporal workflow, and mirrored into Postgres as a queryable record. Temporal owns
 durability and retries. Postgres owns history, so you can answer "what happened on
 attempt 2 of execution 41, and why did it fail" long after the workflow has closed.
 
@@ -25,7 +25,7 @@ restarts, and deploys.
      | POST /executions            GET /executions/{id}
      v
  +--------------------------------------------------+
- |  FastAPI control plane   (app/api)                |
+ |  HTTP control plane   (internal/api)              |
  |  validate -> start workflow -> return execution   |
  +--------------------------------------------------+
      |                                       ^
@@ -39,19 +39,19 @@ restarts, and deploys.
      |  task queue "conductor"               |
      v                                       |
  +--------------------------------------------------+
- |  Worker  (app/temporal/worker.py)                 |
+ |  Worker  (cmd/worker)                             |
  |                                                   |
  |   AgentExecutionWorkflow                          |
  |     |                                             |
- |     +--> activity: add_execution                  |
- |     +--> activity: run_agent_step   [planned]     |
- |     +--> activity: record_attempt   [planned]     |
- |     +--> activity: finalize         [planned]     |
+ |     +--> activity: AddExecution                   |
+ |     +--> activity: RunAgentStep     [planned]     |
+ |     +--> activity: RecordAttempt    [planned]     |
+ |     +--> activity: Finalize         [planned]     |
  +--------------------------------------------------+
-     |  writes through app/db/operations.py
+     |  writes through internal/db/operations.go
      v                                       |
  +--------------------------------------------------+
- |  PostgreSQL   (app/models/models.py)              |
+ |  PostgreSQL   (internal/models/models.go)         |
  |                                                   |
  |   workers ---< attempts >--- executions ---< events
  |                                                   |
@@ -66,72 +66,88 @@ restarts, and deploys.
 
 Working today:
 
-- Schema for `workers`, `executions`, `attempts`, `events`, created via `init_db.py`
-- Async SQLAlchemy engine and session factory over asyncpg
-- `AgentExecutionWorkflow` with a retry policy, calling a single `add_execution` activity
-- Worker entrypoint that connects and polls the `conductor` task queue
+- Schema for `workers`, `executions`, `attempts`, `events`, created by `cmd/initdb`
+- pgx connection pool, plain SQL, no ORM
+- `AgentExecutionWorkflow` with a retry policy, calling a single `AddExecution` activity
+- Worker binary that dials Temporal and polls the `conductor` task queue
 
-Not there yet: the API surface is empty, so the only way to start a workflow right now
-is from a Python shell. There is one write operation and no reads. Nothing yet runs an
-actual agent.
+Not there yet: `internal/api` has no routes and there is no `cmd/api`, so the only way
+to start a workflow right now is the Temporal CLI or a hand-written Go program. There is
+one write operation and no reads. Nothing yet runs an actual agent.
+
+Every gap below is also marked as a numbered `TODO for myself` at the line in the code
+where it bites. `grep -rn "TODO for myself" .` gives the full list.
 
 ## Next Weekend
 
 Ordered so each step is testable before the next one starts.
 
-1. **Finish the repository layer.** `app/db/operations.py` has exactly one function.
-   Add `get_execution`, `list_executions`, `update_execution_state`, plus
-   `create_attempt`, `finish_attempt`, and `append_event`. Take an `AsyncSession`
-   as an argument instead of using the module-level `_db` singleton, so tests can
-   inject a transaction and roll it back.
+0. **Add `workflow_id` and `run_id` to `Execution`, and make `AddExecution`
+   idempotent.** Do this first. Nothing currently links a row back to the workflow
+   that owns it, so cancel and reconcile are impossible, and the activity is a bare
+   `INSERT` sitting under a 3-attempt retry policy, so a crash between commit and ack
+   duplicates the row. Both fixes are one schema change and one `ON CONFLICT` clause,
+   and everything below is built on that shape.
 
-2. **Stand up the control plane.** `app/api/routes.py` is empty and `app/main.py`
-   does not exist, even though the run instructions reference `app.main:app`. Create
-   the FastAPI app with a lifespan that holds the Temporal client, then wire:
+1. **Finish the repository layer.** `internal/db/operations.go` has exactly one
+   function. Add `GetExecution`, `ListExecutions`, `UpdateExecutionState`, plus
+   `CreateAttempt`, `FinishAttempt`, and `AppendEvent`. Move them onto a `Store`
+   struct holding the pool instead of the package-level `pool` global, so a test can
+   hand in its own transaction and roll it back.
+
+2. **Stand up the control plane.** Create `cmd/api/main.go` holding the Temporal
+   client and the pool, then wire routes on a stdlib `http.ServeMux` (Go 1.22+ has
+   method and path patterns, so no router dependency):
    - `POST /executions` starts `AgentExecutionWorkflow` and returns the id
    - `GET /executions/{id}` returns state plus attempts
    - `GET /executions/{id}/events` returns the timeline
+   - `POST /executions/{id}/cancel` signals the workflow, needs step 0
    - `GET /healthz` checks database and Temporal connectivity
+
+   Set `ReadTimeout`, `WriteTimeout`, and graceful shutdown on `SIGTERM`. Go's
+   zero-value `http.Server` has none of them.
 
 3. **Make the workflow do real work.** Replace the single-activity workflow with a
    loop: mark RUNNING, create an attempt row, call the agent step, record success or
-   the error, and finalize. Add a signal for cancellation and a query for live status,
-   so `GET /executions/{id}` can read from the workflow rather than polling the table.
+   the error, and finalize. Add `workflow.GetSignalChannel` for cancellation and
+   `workflow.SetQueryHandler` for live status, so `GET /executions/{id}` can query the
+   running workflow rather than polling the table.
 
-4. **Wire up the agent step.** Add an activity that calls the Claude API through the
-   Anthropic SDK with a heartbeat, so a stalled model call is detected instead of
-   hanging until the timeout.
+4. **Wire up the agent step.** Add an activity that calls the Claude API, with
+   `activity.RecordHeartbeat` and a `HeartbeatTimeout`, so a stalled model call is
+   detected instead of hanging until `StartToCloseTimeout`.
 
-5. **Cover it with tests.** `tests/` is empty. Use Temporal's `WorkflowEnvironment`
-   time-skipping harness for the workflow, mock activities for the retry path, and
-   httpx `ASGITransport` for the routes.
+5. **Cover it with tests.** There are none. `testsuite.WorkflowTestSuite` skips timers,
+   so a workflow with a 30 second timeout tests instantly; `env.OnActivity` covers the
+   retry path; `httptest` covers the routes once they exist.
 
-Stretch, if the above lands early: swap `init_db.create_all` for a real Alembic
-baseline revision, since `migrations/` currently holds only a `.gitkeep`.
+Stretch, if the above lands early: replace `db.InitSchema` with real migration files
+(golang-migrate or goose), since `CREATE TABLE IF NOT EXISTS` will never alter an
+existing table and every step above changes the schema.
 
 ## Requirements
 
-- Python 3.12+
+- Go 1.26+ (a transitive dependency of the Temporal SDK requires it; the toolchain
+  downloads itself on first build)
 - PostgreSQL 14+
 - A Temporal server. For local development: `temporal server start-dev`
 
 ## Setup
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-python -m app.db.init_db
+go mod download
+go run ./cmd/initdb
 ```
 
 ## Running
 
 ```bash
-source ~/Desktop/conductor/.venv/bin/activate
+go run ./cmd/worker      # worker, polls the task queue
+go run ./cmd/api         # control plane, once step 2 lands
 
-python -m app.temporal.worker      # worker, polls the task queue
-uvicorn app.main:app --reload      # control plane, once step 2 lands
-pytest
+go build ./...
+go vet ./...
+go test ./...
 ```
 
 ## Configuration
@@ -139,20 +155,28 @@ pytest
 `.env` in the project root:
 
 ```
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/conductor
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/conductor
 TEMPORAL_ADDRESS=localhost:7233
 TEMPORAL_NAMESPACE=default
 TEMPORAL_TASK_QUEUE=conductor
 ```
 
+A `DATABASE_URL` left over from the Python version (`postgresql+asyncpg://...`) still
+works; `internal/db` strips the SQLAlchemy driver suffix, since pgx does not understand
+it.
+
 ## Layout
 
 ```
-app/api/       FastAPI routers, request and response schemas
-app/models/    SQLAlchemy ORM models
-app/services/  business logic, independent of transport
-app/temporal/  workflows, activities, worker entrypoint
-app/db/        engine, sessions, repository functions
-migrations/    Alembic revisions
-tests/
+cmd/worker/       worker binary, registers workflows and activities
+cmd/initdb/       schema bootstrap
+cmd/api/          control plane binary (not written yet)
+internal/api/     HTTP handlers, request and response types
+internal/models/  database row structs
+internal/services/  business logic, independent of transport
+internal/temporal/  workflow and activity definitions, shared names
+internal/db/      pool, schema, repository functions
 ```
+
+`internal/` is deliberate: nothing outside this module can import these packages, so
+the layout stays free to change.
