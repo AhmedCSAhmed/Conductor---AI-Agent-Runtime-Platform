@@ -3,6 +3,8 @@ package db
 import (
 	"context"
 	"fmt"
+
+	"github.com/AhmedCSAhmed/conductor/internal/models"
 )
 
 // StatePending is the state a freshly created Execution starts in.
@@ -46,6 +48,44 @@ func CreateExecution(ctx context.Context, state string) (int64, error) {
 // order the API and the workflow will want them:
 //
 //	GetExecution(ctx, executionID) (*models.Execution, error)
+
+var err error
+func GetExecution(ctx context.Context, executionID int64) (*models.Execution, error) {
+	poll, err := pool.Acquire()
+	if err != nil {
+		return nil, fmt.Errorf("acquire connection: %w", err)
+	}
+
+	defer poll.Release()
+
+	const query = `
+		SELECT execution_id, state, created_at, updated_at
+		FROM executions
+		WHERE execution_id = $1
+	` 
+
+	rows, err  := poll.Query(ctx, query, executionID)
+	if err != nil {
+		return nil, fmt.Errorf("query execution: %w", err)
+	}
+
+	defer rows.Close()
+
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("rows error: %w", err)
+		}
+		return nil, fmt.Errorf("execution not found")
+	}
+
+	var execution models.Execution
+	if err := rows.Scan(&execution.ExecutionID, &execution.State, &execution.CreatedAt, &execution.UpdatedAt); err != nil {
+		return nil, fmt.Errorf("scan execution: %w", err)
+	}
+	
+	return &execution, nil
+}
+
 //	ListExecutions(ctx, limit, offset) ([]models.Execution, error)
 //	UpdateExecutionState(ctx, executionID, state) error  // must set updated_at
 //	CreateAttempt(ctx, executionID, workerID) (*models.Attempt, error)  // allocates attempt_num
